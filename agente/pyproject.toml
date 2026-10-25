@@ -1,0 +1,17 @@
+[project]
+name = "central-de-salas-agente"
+version = "1.0.0"
+description = "Agente A2A v1.0 (JSON-RPC) que e host MCP por dentro. Sem LLM."
+requires-python = ">=3.10"
+dependencies = [
+    "httpx==0.28.1",
+    "starlette==1.7.0",
+    "uvicorn==0.54.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["agente", "cliente_mcp"]
