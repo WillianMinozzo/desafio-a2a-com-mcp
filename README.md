@@ -75,7 +75,7 @@ Variáveis opcionais (os padrões são os do validador): `MCP_HOST`, `MCP_PORT` 
 
 Tudo em `agente/agente.py`. Em `_traduzir_resultado`, quando o `tools/call` volta com `resultType == "input_required"`, o agente extrai da elicitation em form mode a chave do `inputRequests` e o `enum` do `requestedSchema`, guarda num objeto `Pausa` em `PAUSAS[task_id]` (tool, argumentos, chave, opções e o `requestState` opaco) e põe a Task em `TASK_STATE_INPUT_REQUIRED` com a mensagem `alternativas: <ids>`. O caminho de volta está em `_continuar`: o `SendMessage` com `taskId` e `escolha=<id>` vira `{"action": "accept", "content": {...}}` (ou `escolha=recusar` vira `{"action": "decline"}`), e o agente repete o mesmo `tools/call` com a mesma chave no `inputResponses` e o `requestState` ecoado sem modificação. O id JSON-RPC novo vem do contador monotônico em `agente/cliente_mcp.py` (`ClienteMCP._ids`), então o retry nunca reaproveita o id do request inicial. O cliente MCP do agente é HTTP puro justamente para enxergar o `input_required` cru: um cliente com callback de elicitation responderia sozinho e a Task nunca pausaria.
 
-No servidor (`servidor-mcp/servidor.py`), o conflito é expresso pelo resolver `escolha_de_sala`, ligado ao parâmetro `escolha` da tool `reservar_sala` via `Annotated[ElicitationResult[...], Resolve(...)]`. Quando há conflito ele devolve um `Elicit` com um modelo cujo campo `sala` é um `Literal` das alternativas; o SDK transforma isso em `InputRequiredResult`, checa a capability de elicitation em form mode (senão `-32021` com `requiredCapabilities`) e, no retry, lê `inputResponses` e `requestState` de dentro de `params`.
+No servidor (`servidor-mcp/servidor.py`), `reservar_sala` declara retorno `ReservaOut | InputRequiredResult`. Em conflito, `_perguntar` calcula as alternativas, confere a capability de elicitation em form mode do request (senão `-32021` com `requiredCapabilities`, HTTP 400) e devolve um `InputRequiredResult` com a elicitation na chave `escolha_de_sala` e, como `requestState`, a lista de alternativas oferecidas. No retry, a tool lê `inputResponses` e `requestState` de dentro de `params` (via `Context`) e valida a escolha contra as alternativas que foram seladas, não contra um recálculo.
 
 ## Decisões técnicas
 
@@ -83,7 +83,7 @@ No servidor (`servidor-mcp/servidor.py`), o conflito é expresso pelo resolver `
 
 **Validade.** 10 minutos (`TTL_REQUEST_STATE = 600`), dentro da faixa de 5 a 30.
 
-**Stateless de verdade.** O servidor não guarda nada entre o `input_required` e o retry: o resolver roda de novo, recalcula as alternativas e o SDK só aceita a resposta se a pergunta renderizada for idêntica à que foi selada. Como a chave vem do ambiente e não do processo, um retry funciona depois de reiniciar o servidor MCP. Cada request precisa trazer `protocolVersion` e `clientCapabilities` no `_meta` (`-32602` e HTTP 400 caso contrário); os headers `MCP-Protocol-Version`, `Mcp-Method` e `Mcp-Name` são conferidos contra o corpo (`-32020`).
+**Stateless de verdade.** O servidor não guarda nada entre o `input_required` e o retry: as alternativas oferecidas viajam seladas no `requestState`, e a escolha é validada contra elas. Como a chave vem do ambiente e não do processo, um retry funciona depois de reiniciar o servidor MCP, mesmo que as reservas em memória tenham mudado. Se a sala escolhida tiver sido ocupada entre a pergunta e o retry, o servidor pergunta de novo em vez de gravar sobreposição. Cada request precisa trazer `protocolVersion` e `clientCapabilities` no `_meta` (`-32602` e HTTP 400 caso contrário); os headers `MCP-Protocol-Version`, `Mcp-Method` e `Mcp-Name` são conferidos contra o corpo (`-32020`).
 
 **Estado das Tasks.** Em memória no processo do agente: `TASKS` (a visão pública que `GetTask` devolve), `PAUSAS` (o estado MRTR pendente, que nunca sai pela API A2A) e `TRACES` (o trace-id da Task). Cada Task tem um `asyncio.Lock`, então duas continuações da mesma Task não se cruzam e Tasks diferentes nunca compartilham `requestState`. Estados terminais (`COMPLETED`, `CANCELED`, `FAILED`) são definitivos: novo `SendMessage` na Task é recusado com erro JSON-RPC `-32004`. Task inexistente devolve `-32001`.
 
@@ -96,7 +96,7 @@ No servidor (`servidor-mcp/servidor.py`), o conflito é expresso pelo resolver `
 ## Saída do validador
 
 ```
-trace-id desta execucao: fd76f348be0807e038196a6213b9aff5
+trace-id desta execucao: fe7167a1d48bef9f644cc6a2ceb1f65d
 procure esse valor no stderr do servidor MCP para conferir a propagacao do traceparent.
 
 PASS 01 tools/list traz as tres tools

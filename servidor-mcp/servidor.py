@@ -1,10 +1,10 @@
 """Servidor MCP "central-de-salas" (Streamable HTTP, stateless, spec 2026-07-28).
 
 Tres tools (listar_salas, consultar_disponibilidade, reservar_sala) e um resource
-(politica://uso). O conflito de horario em reservar_sala vira MRTR: o resolver
-`escolha_de_sala` devolve um `Elicit`, o SDK responde `input_required` e sela o
-`requestState` com AES-256-GCM (RequestStateBoundary) usando REQUEST_STATE_SECRET.
-Nada fica em memoria entre o input_required e o retry.
+(politica://uso). O conflito de horario em reservar_sala vira MRTR: a tool devolve
+um `InputRequiredResult` com a elicitation e um requestState com as alternativas
+oferecidas; o SDK (RequestStateBoundary) sela esse requestState com AES-256-GCM
+usando REQUEST_STATE_SECRET. Nada fica em memoria entre o input_required e o retry.
 """
 
 from __future__ import annotations
@@ -14,20 +14,20 @@ import os
 import sys
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import uvicorn
-from pydantic import BaseModel, Field, create_model
-
-from mcp.server.mcpserver import (
-    Elicit,
-    ElicitationResult,
-    AcceptedElicitation,
-    MCPServer,
-    RequestStateSecurity,
-    Resolve,
+from mcp_types import (
+    MISSING_REQUIRED_CLIENT_CAPABILITY,
+    ElicitRequest,
+    ElicitRequestFormParams,
+    InputRequiredResult,
 )
+from pydantic import BaseModel
+
+from mcp.server.mcpserver import Context, MCPServer, RequestStateSecurity
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 RAIZ = Path(__file__).resolve().parent.parent
 DADOS = RAIZ / "dados"
@@ -155,16 +155,8 @@ class ReservaOut(BaseModel):
     motivo: str | None = None
 
 
-class EscolhaBase(BaseModel):
-    """Base do formulario da elicitation; o enum real e montado por pedido."""
-
-
-def _modelo_escolha(opcoes: list[str]) -> type[EscolhaBase]:
-    return create_model(
-        "EscolhaDeSala",
-        __base__=EscolhaBase,
-        sala=(Literal[tuple(opcoes)], Field(title="Sala", description="Sala alternativa escolhida")),  # type: ignore[valid-type]
-    )
+CHAVE_ELICITATION = "escolha_de_sala"
+MENSAGEM_ELICITATION = "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa."
 
 
 # ------------------------------------------------------------------------- server
@@ -203,49 +195,84 @@ def consultar_disponibilidade(sala: str, inicio: str, fim: str) -> Disponibilida
     return Disponibilidade(sala=sala, livre=not em_conflito, conflitos=em_conflito)
 
 
-def escolha_de_sala(sala: str, inicio: str, fim: str) -> Elicit[EscolhaBase] | None:
-    """Resolver do MRTR: so pergunta quando a sala pedida esta ocupada.
+def _exigir_elicitation_form(ctx: Context) -> None:
+    """-32021 se o cliente nao declarou elicitation em form mode neste request."""
+    caps = ctx.client_capabilities
+    elicitation = caps.elicitation if caps is not None else None
+    # `elicitation: {}` sem modos conta como form (forma anterior aos modos); so url nao conta.
+    if elicitation is not None and (elicitation.form is not None or elicitation.url is None):
+        return
+    raise MCPError(
+        code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+        message="Client did not declare the form elicitation capability required by reservar_sala",
+        data={"requiredCapabilities": {"elicitation": {"form": {}}}},
+    )
 
-    Roda de novo em cada rodada; o SDK so aceita a resposta se a pergunta
-    renderizada for identica a que foi selada no requestState.
-    """
-    ini, fi = validar(sala, inicio, fim)
-    if not conflitos(sala, ini, fi):
-        return None
+
+def _perguntar(ctx: Context, sala: str, ini: datetime, fi: datetime) -> InputRequiredResult:
     opcoes = alternativas(sala, ini, fi)
     if not opcoes:
         raise ToolError(ERRO_SEM_ALTERNATIVA)
-    return Elicit(
-        "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa.",
-        _modelo_escolha(opcoes),
+    _exigir_elicitation_form(ctx)
+    schema = {
+        "type": "object",
+        "properties": {
+            "sala": {"type": "string", "title": "Sala", "description": "Sala alternativa escolhida", "enum": opcoes}
+        },
+        "required": ["sala"],
+    }
+    pedido = ElicitRequest(params=ElicitRequestFormParams(message=MENSAGEM_ELICITATION, requested_schema=schema))
+    # Este JSON e o plaintext; o RequestStateBoundary sela (AES-GCM + exp + binding dos argumentos)
+    # antes de sair, e so devolve ao handler o que ele mesmo emitiu.
+    estado = json.dumps({"v": 1, "alternativas": opcoes}, separators=(",", ":"))
+    return InputRequiredResult(input_requests={CHAVE_ELICITATION: pedido}, request_state=estado)
+
+
+def _ler_estado(texto: str | None) -> list[str] | None:
+    if not texto:
+        return None
+    try:
+        dados = json.loads(texto)
+    except ValueError:
+        return None
+    opcoes = dados.get("alternativas") if isinstance(dados, dict) and dados.get("v") == 1 else None
+    return [str(o) for o in opcoes] if isinstance(opcoes, list) else None
+
+
+def _campo(obj: Any, nome: str) -> Any:
+    return obj.get(nome) if isinstance(obj, dict) else getattr(obj, nome, None)
+
+
+def _gravar(sala: str, inicio: str, fim: str, responsavel: str) -> ReservaOut:
+    reserva = {"id": _proximo_id(), "sala": sala, "inicio": inicio, "fim": fim, "responsavel": responsavel}
+    RESERVAS.append(reserva)
+    log(f"reserva criada {reserva['id']} sala={sala} {inicio}..{fim} responsavel={responsavel}")
+    return ReservaOut(
+        reserva=reserva["id"], sala=sala, inicio=inicio, fim=fim, responsavel=responsavel, politica=POLITICA_VERSAO
     )
 
 
 @mcp.tool(description="Reserva uma sala. Se o intervalo estiver ocupado, pergunta qual alternativa usar.")
-def reservar_sala(
-    sala: str,
-    inicio: str,
-    fim: str,
-    responsavel: str,
-    escolha: Annotated[ElicitationResult[EscolhaBase], Resolve(escolha_de_sala)],
-) -> ReservaOut:
-    if not isinstance(escolha, AcceptedElicitation):
-        return ReservaOut(reservado=False, motivo="recusado")
-    sala_final = escolha.data.sala if escolha.data is not None else sala
-    ini, fi = validar(sala_final, inicio, fim)
-    if conflitos(sala_final, ini, fi):  # defesa: nunca grava sobreposicao
-        raise ToolError(ERRO_SEM_ALTERNATIVA)
-    reserva = {"id": _proximo_id(), "sala": sala_final, "inicio": inicio, "fim": fim, "responsavel": responsavel}
-    RESERVAS.append(reserva)
-    log(f"reserva criada {reserva['id']} sala={sala_final} {inicio}..{fim} responsavel={responsavel}")
-    return ReservaOut(
-        reserva=reserva["id"],
-        sala=sala_final,
-        inicio=inicio,
-        fim=fim,
-        responsavel=responsavel,
-        politica=POLITICA_VERSAO,
-    )
+def reservar_sala(sala: str, inicio: str, fim: str, responsavel: str, ctx: Context) -> ReservaOut | InputRequiredResult:
+    ini, fi = validar(sala, inicio, fim)
+
+    # Retry: o boundary ja verificou integridade, expiracao e que os argumentos sao os selados.
+    oferecidas = _ler_estado(ctx.request_state)
+    resposta = (ctx.input_responses or {}).get(CHAVE_ELICITATION) if oferecidas is not None else None
+    if resposta is not None:
+        acao = _campo(resposta, "action")
+        if acao in ("decline", "cancel"):
+            return ReservaOut(reservado=False, motivo="recusado")
+        escolhida = _campo(_campo(resposta, "content") or {}, "sala")
+        if acao != "accept" or escolhida not in oferecidas:
+            raise ToolError(f"Escolha invalida: a sala deve ser uma de {', '.join(oferecidas)}")
+        if conflitos(escolhida, ini, fi):  # ocupada desde a pergunta: pergunta de novo
+            return _perguntar(ctx, sala, ini, fi)
+        return _gravar(escolhida, inicio, fim, responsavel)
+
+    if not conflitos(sala, ini, fi):
+        return _gravar(sala, inicio, fim, responsavel)
+    return _perguntar(ctx, sala, ini, fi)
 
 
 @mcp.resource("politica://uso", name="politica-de-uso", description="Politica de uso das salas.", mime_type="text/markdown")
